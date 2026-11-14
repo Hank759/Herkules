@@ -107,3 +107,63 @@ fn parse_frame(id: &str, payload: &str) -> Option<Frame> {
     }
     Frame::new_standard(id, &bytes[..payload.len() / 2]).ok()
 }
+
+/// Parse a host request: TX <ID> <LEN> <DATA>
+pub fn parse_bridge_tx(command: &str) -> Option<Frame> {
+    let mut parts = command.split_ascii_whitespace();
+    if parts.next() != Some("TX") {
+        return None;
+    }
+    let id = parts.next()?;
+    let length: usize = parts.next()?.parse().ok()?;
+    let data = parts.next()?;
+
+    // Reject extra fields.
+    if parts.next().is_some() {
+        return None;
+    }
+
+    // Classical CAN supports 0 to 8 data bytes.
+    if length > 8 {
+        return None;
+    }
+
+    // '-' represents an empty payload.
+    if data == "-" {
+        if length != 0 {
+            return None;
+        }
+    } else if data.len() != length * 2 {
+        return None;
+    }
+
+    // Reuse the existing hexadecimal parser.
+    parse_frame(id, data)
+}
+
+/// Format a received CAN frame for the host.
+pub fn format_bridge_rx(frame: &Frame) -> Option<String<63>> {
+    let Id::Standard(id) = *frame.id() else {
+        return None;
+    };
+
+    if frame.is_remote_frame() {
+        return None;
+    }
+
+    let mut output = String::<63>::new();
+    let data = frame.data();
+
+    write!(&mut output, "RX {:03X} {} ", id.as_raw(), data.len()).ok()?;
+
+    if data.is_empty() {
+        output.push('-').ok()?;
+    } else {
+        for byte in data {
+            write!(&mut output, "{byte:02X}").ok()?;
+        }
+    }
+
+    output.push('\n').ok()?;
+    Some(output)
+}

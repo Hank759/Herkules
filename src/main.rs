@@ -7,6 +7,15 @@ mod protocol;
 pub mod swd;
 mod wiring;
 
+use core::fmt::Write as _;
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::Channel,
+};
+use embassy_stm32::can::Frame;
+use embassy_time::{with_timeout, Duration};
+use heapless::String;
+
 use board::Usb;
 use embassy_executor::Spawner;
 use embassy_futures::{join::join4, select::select};
@@ -22,6 +31,17 @@ use static_cell::StaticCell;
 use swd::Swd;
 
 const PACKET: usize = 64;
+static CAN_TX_QUEUE: Channel<CriticalSectionRawMutex, Frame, 8> =
+    Channel::new();
+
+static USB_TX_QUEUE: Channel<CriticalSectionRawMutex, String<63>, 16> =
+    Channel::new();
+
+fn queue_usb_message(message: &str) {
+    if let Ok(text) = String::<63>::try_from(message) {
+        let _ = USB_TX_QUEUE.try_send(text);
+    }
+}
 // Track linker-script changes so Cargo relinks the firmware.
 const _: &[u8] = include_bytes!("../memory.x");
 
@@ -62,26 +82,103 @@ async fn main(_spawner: Spawner) {
 }
 
 async fn control_port(
-    mut usb: CdcAcmClass<'static, Usb>,
-    mut can: Can<'static>,
+    usb: CdcAcmClass<'static, Usb>,
+    can: Can<'static>,
     mut swd: Option<Swd>,
 ) {
-    let mut packet = [0; PACKET];
-    loop {
-        usb.wait_connection().await;
-        let mut line = protocol::Line::new();
-        'connection: while let Ok(n) = usb.read_packet(&mut packet).await {
-            for &byte in &packet[..n] {
-                if let Some(command) = line.push(byte) {
-                    let reply = protocol::execute(command, &mut can, &mut swd).await;
-                    // Responses are bounded below 64 B, so USB needs no extra ZLP.
-                    if usb.write_packet(reply.as_bytes()).await.is_err() {
-                        break 'connection;
+    let (mut usb_tx, mut usb_rx) = usb.split();
+    let (mut can_tx, mut can_rx, _props) = can.split();
+    
+    // Task 1: USB -> CAN
+    let usb_reader = async {
+        let mut packet = [0u8; PACKET];
+        loop {
+            usb_rx.wait_connection().await;
+            let mut line = protocol::Line::new();
+
+            while let Ok(n) = usb_rx.read_packet(&mut packet).await {
+                for &byte in &packet[..n] {
+                    let Some(command) = line.push(byte) else {
+                        continue;
+                    };
+
+                    if command == "PING" {
+                        queue_usb_message("OK DM-MC02\n");
+                    }else if command == "SWD ID" {
+                        if let Some(swd) = swd.as_mut() {
+                            if let Some(id) = swd.read_dpidr() {
+                                let mut reply = String::<63>::new();
+                                let _ = writeln!(&mut reply, "OK DPIDR {id:08X}");
+                                let _ = USB_TX_QUEUE.try_send(reply);
+                            } else {
+                                queue_usb_message("ERR SWD\n");
+                            }
+                        } else {
+                            queue_usb_message("ERR SWD_NOT_CONFIGURED\n");
+                        }
+                    } else if command == "CAN RX" {
+                        queue_usb_message("ERR USE STREAM MODE\n");
+                    }else if let Some(frame) = protocol::parse_bridge_tx(command) {
+                        if CAN_TX_QUEUE.try_send(frame).is_ok() {
+                            queue_usb_message("OK QUEUED\n");
+                        } else {
+                            queue_usb_message("ERR CAN QUEUE FULL\n");
+                        }
+                    } else {
+                        queue_usb_message("ERR SYNTAX\n");
                     }
                 }
             }
+            CAN_TX_QUEUE.clear();
         }
-    }
+    };
+
+    // Task 2: Send CAN frames
+    let can_writer = async {
+        loop {
+            let frame = CAN_TX_QUEUE.receive().await;
+
+            match with_timeout(Duration::from_millis(100), can_tx.write(&frame)).await {
+                Ok(None) => queue_usb_message("OK CAN TX\n"),
+                _ => queue_usb_message("ERR CAN TX\n"),
+            }
+        }
+    };
+
+    // Task 3: CAN -> USB
+    let can_reader = async {
+        loop {
+            match can_rx.read().await {
+                Ok(envelope) => {
+                    if let Some(message) = protocol::format_bridge_rx(&envelope.frame) {
+                        let _ = USB_TX_QUEUE.try_send(message);
+                    }
+                }
+                Err(_) => {
+                    queue_usb_message("ERR CAN RX\n");
+                    embassy_time::Timer::after_millis(10).await;
+                }
+            }
+        }
+    };
+
+    // Task 4: USB output
+    let usb_writer = async {
+        loop {
+            usb_tx.wait_connection().await;
+
+            loop {
+                let message = USB_TX_QUEUE.receive().await;
+                let result = with_timeout(Duration::from_millis(200), usb_tx.write_packet(message.as_bytes())).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    _ => { USB_TX_QUEUE.clear(); break; }
+                }
+            }
+        }
+    };
+
+    join4(usb_reader, can_writer, can_reader, usb_writer).await;
 }
 
 async fn uart_port(usb: CdcAcmClass<'static, Usb>, uart: Option<BufferedUart<'static>>) {

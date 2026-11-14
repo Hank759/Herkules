@@ -1,0 +1,22 @@
+warning: type alias `Reply` is never used
+ --> src\protocol.rs:9:6
+  |
+9 | type Reply = String<63>;
+  |      ^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `fixed` is never used
+  --> src\protocol.rs:41:4
+   |
+41 | fn fixed(text: &str) -> Reply {
+   |    ^^^^^
+
+warning: function `execute` is never used
+  --> src\protocol.rs:45:14
+   |
+45 | pub async fn execute(command: &str, can: &mut Can<'_>, swd: &mut Option<Sw...
+   |              ^^^^^^^
+
+warning: `dm-mc02-cmsis-dap` (bin "dm-mc02-cmsis-dap") generated 3 warnings
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.55s
