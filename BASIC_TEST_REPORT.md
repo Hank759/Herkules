@@ -38,8 +38,7 @@ python host.py COM6 ping             |  OK DM-MC02                      |  PASS
 python host.py COM7 uart-loopback    |  OK UART loopback                |  PASS
 
 4. Verified Configuration（实测确认的配置）
-SWD GPIO Mapping
-根据原始 wiring.rs：
+SWD GPIO Mapping 根据原始 wiring.rs：
 SWCLK: PE9，GPIO Output，initially Low
 SWDIO: PE13，GPIO Flex，bidirectional
 连接至同板 SWD 接口后，连续两次运行 SWD ID，参考测试记录均返回：OK DPIDR 6BA02477
